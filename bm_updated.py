@@ -5,8 +5,7 @@ import os
 # TODO 1: plot final positions across different runs. ✅
 # TODO 2: compare this to the case of using extrinsic mean, for the same parameters. ✅
 # TODO 3: Added plotting code for d>3 ✅
-init_seed = 32
-
+init_seed = 30
 def ensure_3d(Z):
     """
     Z: (m, q) with q<=3  -> (m,3) by zero-padding extra columns.
