@@ -172,8 +172,26 @@ def simulate_intrinsic_noise(n, d, T, dt, b, Q, K, V_mat, sigma0,
 
         all_traj[r] = traj
 
-    # Average trajectory across runs 
-    mean_traj = all_traj.mean(axis=0)  # (kept, n, d)
+    # Average trajectory over runs  (replaced by intrinsic mean over runs)
+    # mean_traj = all_traj.mean(axis=0)  # (kept, n, d)
+
+    # intrinsic mean over runs (per time, per agent) with warm start + incremental refine
+    # a final stricter refine on the last frame
+    mean_traj = np.zeros((kept, n, d), dtype=float)
+    # warm start at t=0 for each agent
+    for i in range(n):
+        pts0 = all_traj[:, 0, i, :]                       # (runs, d)
+        mean_traj[0, i] = intrinsic_mean_Sd(pts0, tol=1e-10, max_iter=50)
+    # incremental refine across stored frames
+    for t in range(1, kept):
+        for i in range(n):
+            pts_t = all_traj[:, t, i, :]                  # (runs, d)
+            u_prev = mean_traj[t-1, i]
+            mean_traj[t, i] = intrinsic_mean_refine(u_prev, pts_t, iters=mean_refine_steps, step=1.0)
+    # final stricter refine on the last stored frame
+    for i in range(n):
+        pts_last = all_traj[:, -1, i, :]
+        mean_traj[-1, i] = intrinsic_mean_Sd(pts_last, tol=1e-12, max_iter=200)
 
     final_positions = all_traj[:, -1, :, :]  # (runs, n, d)
 
@@ -186,11 +204,11 @@ def euclidean_distance(x, y):
 
 # ----------  Convergence check & plots ----------
 if __name__ == "__main__":
-    n, d = 3 ,3
-    T, dt = 200.0, 0.005
+    n, d = 10, 3
+    T, dt = 600.0, 0.005
     # b, sigma0 = 1.0, 0.2
-    b, sigma0 = 9.0, 0.0
-    runs = 1
+    b, sigma0 = 6.0, 0.05
+    runs = 10
     
     init_seed = 30
     outdir = "plots"  
@@ -225,19 +243,19 @@ if __name__ == "__main__":
         else:
             consensus_point = center_raw
         print("Converged.")
-        print("Consensus mean vector (unprojected):", center_raw)
+        print("Consensus mean vector:", center_raw)
     else:
         print("System did not converge.")
 
-    # Plot max pairwise distance of the unprojected mean
+    # Plot max pairwise distance of the mean
     fig1 = plt.figure(figsize=(7,4))
-    plt.plot(times, delta, lw=1.5, label="Max pairwise distance (unprojected mean)")
+    plt.plot(times, delta, lw=1.5, label="Max pairwise distance (mean)")
     plt.axhline(threshold, color='red', ls='--', label="Threshold 1e-2")
     plt.yscale('log')
     plt.xlabel("Time"); plt.ylabel("Max pairwise distance")
-    plt.title("Convergence of Averaged (Unprojected) Trajectories")
+    plt.title("Convergence of Averaged Trajectories")
     plt.grid(True); plt.legend(); plt.tight_layout(); 
-    fig1.savefig(os.path.join(outdir, f"convergence_seed{init_seed}_metastable_new.png"),
+    fig1.savefig(os.path.join(outdir, f"convergence_seed{init_seed}_n=10_d=3_smallsigma.png"),
                  dpi=200, bbox_inches="tight")
     #fig1.savefig("test0.png", dpi=200, bbox_inches="tight")
     plt.show()
@@ -284,14 +302,14 @@ if __name__ == "__main__":
             Pend= pca_transform(mean_traj[-1], mu_mt, W_mt)    # (n,3)
 
         ax.scatter(P0[:,0],  P0[:,1],  P0[:,2],
-                   color='blue', s=25, label='Mean start (unprojected/PCA)')
+                   color='blue', s=25, label='Mean start (PCA)')
         ax.scatter(Pend[:,0], Pend[:,1], Pend[:,2],
-                   color='red',  s=25, label='Mean end (unprojected/PCA)')
+                   color='red',  s=25, label='Mean end (PCA)')
 
         ax.set_box_aspect([1,1,1])
-        ax.set_title("Averaged Trajectories (unprojected; PCA if d>3)")
+        ax.set_title("Averaged Trajectories (PCA if d>3)")
         ax.legend(); plt.tight_layout()
-        fig2.savefig(os.path.join(outdir, f"avg_traj_3d_seed{init_seed}_metastable_new.png"),
+        fig2.savefig(os.path.join(outdir, f"avg_traj_3d_seed{init_seed}_n=10_d=3_smallsigma.png"),
                      dpi=200, bbox_inches="tight")
         plt.show()
     # if d > 3 use PCA
@@ -320,7 +338,7 @@ if __name__ == "__main__":
                        label=f'Final positions (particle {particle_idx})', zorder=3)
 
             ax.scatter([raw_mean[0]], [raw_mean[1]], [raw_mean[2]],
-                       marker='x', s=120, color='red', label='Mean (unprojected/PCA)',
+                       marker='x', s=120, color='red', label='Mean (PCA)',
                        depthshade=False, zorder=9)
 
             ax.set_box_aspect([1, 1, 1])
@@ -344,6 +362,6 @@ if __name__ == "__main__":
             ax.legend(loc='upper left')
 
         plt.tight_layout()
-        fig3.savefig(os.path.join(outdir, f"final_positions_particle{particle_idx}_seed{init_seed}_metastable_new.png"),
+        fig3.savefig(os.path.join(outdir, f"final_positions_particle{particle_idx}_seed{init_seed}_n=10_d=3_smallsigma.png"),
                      dpi=200, bbox_inches="tight")
         plt.show()
