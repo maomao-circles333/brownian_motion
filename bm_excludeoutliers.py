@@ -5,14 +5,7 @@ import os
 # TODO 1: plot final positions across different runs. ✅
 # TODO 2: compare this to the case of using extrinsic mean, for the same parameters. ✅
 # TODO 3: Added plotting code for d>3 ✅
-init_seed = 39
-
-'''
-def ginibre(d_in, d_out, rng, normalized=True):
-    G = rng.randn(d_in, d_out)           # i.i.d. N(0,1)
-    return G/np.sqrt(d_in) if normalized else G
-'''
-
+init_seed = 30
 def ensure_3d(Z):
     """
     Z: (m, q) with q<=3  -> (m,3) by zero-padding extra columns.
@@ -112,9 +105,6 @@ def dynamics(x, b=1.0, Q=None, K=None, V_mat=None):
     K = np.eye(d) if K is None else K
     V_mat = np.eye(d) if V_mat is None else V_mat
 
-    rng_w = np.random.RandomState(42)
-
-    
     q_all = (Q @ x.T).T          # (n,d)
     k_all = (K @ x.T).T          # (n,d)
     v_all = (V_mat @ x.T).T      # (n,d)
@@ -123,7 +113,7 @@ def dynamics(x, b=1.0, Q=None, K=None, V_mat=None):
     w = np.exp(b * inner)
     w /= w.sum(axis=1, keepdims=True)
     V = w @ v_all                # (n,d)
-    
+
     # project onto tangent at each x[i]
     return V - (np.sum(V * x, axis=1, keepdims=True)) * x
 
@@ -134,7 +124,7 @@ def simulate_intrinsic_noise(n, d, T, dt, b, Q, K, V_mat, sigma0,
                              store_stride=1):  
     steps = int(T/dt)
 
-    # number of stored frames (always include first)
+    # FIXED: number of stored frames (always include first)
     kept = steps // store_stride + 1
     all_traj = np.zeros((runs, kept, n, d), dtype=float) 
 
@@ -185,26 +175,71 @@ def simulate_intrinsic_noise(n, d, T, dt, b, Q, K, V_mat, sigma0,
     # Average trajectory over runs  (replaced by intrinsic mean over runs)
     # mean_traj = all_traj.mean(axis=0)  # (kept, n, d)
 
-    # intrinsic mean over runs (per time, per agent) with warm start + incremental refine
-    # a final stricter refine on the last frame
+    # ----- NEW: robust intrinsic mean over runs that excludes outliers -----
+    # Outlier rule: remove runs with large geodesic angle relative to the current center
+    # using a median + k * MAD cutoff (fallback: keep closest 75% if MAD collapses).
+    def angular_distances(u, X):
+        c = np.clip(X @ u, -1.0, 1.0)
+        return np.arccos(c)  # radians
+
+    def trim_mask_by_mad(thetas, k=3.0, min_keep=3, fallback_keep_frac=0.75):
+        thetas = np.asarray(thetas, float).ravel()
+        if thetas.size == 0:
+            return np.zeros_like(thetas, dtype=bool)
+        med = np.median(thetas)
+        mad = np.median(np.abs(thetas - med))
+        if mad <= 1e-15:
+            # MAD collapses: keep the smallest angles up to fallback_keep_frac
+            keep = max(min_keep, int(np.ceil(fallback_keep_frac * thetas.size)))
+            idx = np.argsort(thetas)[:keep]
+            mask = np.zeros_like(thetas, dtype=bool)
+            mask[idx] = True
+            return mask
+        cutoff = med + k * mad
+        mask = (thetas <= cutoff)
+        # ensure we don't drop too many
+        if mask.sum() < max(min_keep, int(np.ceil(fallback_keep_frac * thetas.size))):
+            keep = max(min_keep, int(np.ceil(fallback_keep_frac * thetas.size)))
+            idx = np.argsort(thetas)[:keep]
+            mask = np.zeros_like(thetas, dtype=bool)
+            mask[idx] = True
+        return mask
+
     mean_traj = np.zeros((kept, n, d), dtype=float)
-    # warm start at t=0 for each agent
+    # warm start at t=0 for each agent (trim + refine)
     for i in range(n):
-        pts0 = all_traj[:, 0, i, :]                       # (runs, d)
-        mean_traj[0, i] = intrinsic_mean_Sd(pts0, tol=1e-10, max_iter=50)
-    # incremental refine across stored frames
+        pts0 = all_traj[:, 0, i, :]                               # (runs, d)
+        u0  = intrinsic_mean_Sd(pts0, tol=1e-10, max_iter=50)
+        th0 = angular_distances(u0, pts0)
+        mask0 = trim_mask_by_mad(th0, k=3.0)
+        if mask0.sum() >= 1:
+            u0 = intrinsic_mean_refine(u0, pts0[mask0], iters=2, step=1.0)
+        mean_traj[0, i] = u0
+
+    # incremental refine across stored frames with trimming at each frame
     for t in range(1, kept):
         for i in range(n):
-            pts_t = all_traj[:, t, i, :]                  # (runs, d)
+            pts_t = all_traj[:, t, i, :]                          # (runs, d)
             u_prev = mean_traj[t-1, i]
-            mean_traj[t, i] = intrinsic_mean_refine(u_prev, pts_t, iters=mean_refine_steps, step=1.0)
+            th_t = angular_distances(u_prev, pts_t)
+            mask_t = trim_mask_by_mad(th_t, k=3.0)
+            if mask_t.sum() >= 1:
+                mean_traj[t, i] = intrinsic_mean_refine(u_prev, pts_t[mask_t], iters=2, step=1.0)
+            else:
+                mean_traj[t, i] = u_prev
 
-    # ***** CHANGED: give EVERY stored frame the same strict solve 
-    for t in range(kept):
-        for i in range(n):
-            pts_t = all_traj[:, t, i, :]
-            mean_traj[t, i] = intrinsic_mean_Sd(pts_t, tol=1e-12, max_iter=200)
-    # * end CHANGED
+    # final stricter refine on the last stored frame (with trimming)
+    for i in range(n):
+        pts_last = all_traj[:, -1, i, :]
+        u_last = mean_traj[-1, i]
+        th_last = angular_distances(u_last, pts_last)
+        mask_last = trim_mask_by_mad(th_last, k=3.0)
+        if mask_last.sum() >= 1:
+            # start from u_last for stability, then a stricter solve on trimmed set
+            u_last = intrinsic_mean_refine(u_last, pts_last[mask_last], iters=5, step=1.0)
+            u_last = intrinsic_mean_Sd(pts_last[mask_last], tol=1e-12, max_iter=200)
+        mean_traj[-1, i] = u_last
+    # ----- END NEW -----
 
     final_positions = all_traj[:, -1, :, :]  # (runs, n, d)
 
@@ -217,27 +252,18 @@ def euclidean_distance(x, y):
 
 # ----------  Convergence check & plots ----------
 if __name__ == "__main__":
-    n, d = 3, 3
-    T, dt = 500.0, 0.005
+    n, d = 10, 3
+    T, dt = 100.0, 0.005
     # b, sigma0 = 1.0, 0.2
-    b, sigma0 = 6.0, 0.0
+    b, sigma0 = 4.0, 0.0
     runs = 1
     
-    #init_seed = 39
+    init_seed = 30
     outdir = "plots"  
     os.makedirs(outdir, exist_ok=True)
 
     Q = np.eye(d); K = np.eye(d); V_mat = np.eye(d)
-    
-    # Q, K orthonormal
-    # V random
-    '''
-    Q = np.linalg.qr(np.random.randn(d, d))[0]
-    K = np.linalg.qr(np.random.randn(d, d))[0]
-    Q = np.random.randn(d, d) 
-    K = np.random.randn(d, d)  
-    V_mat = np.random.randn(d, d)   
-    '''
+
     mean_traj, final_positions = simulate_intrinsic_noise(
         n, d, T, dt, b, Q, K, V_mat, sigma0,
         runs=runs, mean_refine_steps=2,
@@ -252,14 +278,10 @@ if __name__ == "__main__":
     delta = np.zeros(steps)
     for k in range(steps):
         P = mean_traj[k]                     # (n,d)
-        # use geodesic pairwise distance
-        Pn = normalize_rows(P)               # keep numerically on the sphere
-        G = np.clip(Pn @ Pn.T, -1.0, 1.0)    # dot products
-        Theta = np.arccos(G)                 # pairwise angles in radians
-        delta[k] = Theta.max()
+        D = np.linalg.norm(P[:, None, :] - P[None, :, :], axis=2)
+        delta[k] = D.max()
 
-
-    threshold = 1e-2
+    threshold = 1e-1
     if delta[-1] < threshold:
         final_mean = mean_traj[-1]           # (n,d)
         center_raw = final_mean.mean(axis=0) # no projection
@@ -275,11 +297,11 @@ if __name__ == "__main__":
 
     # Plot max pairwise distance of the mean
     fig1 = plt.figure(figsize=(7,4))
-    plt.plot(times, delta, lw=1.5, label="Max pairwise geodesic distance (radians)")
+    plt.plot(times, delta, lw=1.5, label="Max pairwise distance (mean)")
     plt.axhline(threshold, color='red', ls='--', label="Threshold 1e-2")
     plt.yscale('log')
-    plt.xlabel("Time"); plt.ylabel("Max pairwise angle (rad)")
-    plt.title("Convergence of Averaged Trajectories (geodesic)")
+    plt.xlabel("Time"); plt.ylabel("Max pairwise distance")
+    plt.title("Convergence of Averaged Trajectories")
     plt.grid(True); plt.legend(); plt.tight_layout(); 
     fig1.savefig(os.path.join(outdir, f"convergence_seed{init_seed}_n=10_d=3_smallsigma.png"),
                  dpi=200, bbox_inches="tight")
