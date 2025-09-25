@@ -1,0 +1,33 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+
+# Virtual envs
+.venv/
+venv/
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# Build / logs
+build/
+dist/
+*.log
+
+# Data & results (keep them in $PROJECT/$SCRATCH, not in Git)
+data/
+outputs/
+out_*/
+*.npz
+*.npy
+logs/
+out_cc_sweep/
+# IDE
+.vscode/
+.idea/
+out_cc_drift/
+# OS
+.DS_Store
+simulate_sigma_shard.py
