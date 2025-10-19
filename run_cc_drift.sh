@@ -2,31 +2,31 @@
 #SBATCH --job-name=cc_drift
 #SBATCH --account=def-razvan05 
 #SBATCH --time=06:00:00
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=64
 #SBATCH --mem=64G
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
-#SBATCH --array=0-1999%200             # 100 sigma-bins × 20 shards/bin
+#SBATCH --array=0-499%200             # 150 sigma-bins × 20 shards/bin
 
 set -euo pipefail
 set -x
 
 # Sweep & sharding
-BINS=100
+BINS=50
 SIGMA_MIN=0.0
-SIGMA_MAX=0.5
+SIGMA_MAX=1.5
 
-TOT_INITS=100
-RUNS_PER_INIT=100
+TOT_INITS=50
+RUNS_PER_INIT=50
 INITS_PER_TASK=5
 NUM_SHARDS=$(( (TOT_INITS + INITS_PER_TASK - 1) / INITS_PER_TASK ))  # 20 shards/bin
 
 # Dynamics
 N=32
 D=3
-BETA=5.0
-DT=0.1
-TMAX=3000.0
+BETA=2.0
+DT=0.001
+TMAX=300.0
 THRESH=0.01
  
 # Intrinsic-mean params

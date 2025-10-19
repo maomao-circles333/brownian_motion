@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-# Intrinsic noise + intrinsic *mean trajectory (across runs)* consensus time.
-# To save memory: computes trajectory on server, stores only per-init scalars
+# Intrinsic noise + intrinsic *mean trajectory* consensus time.
+# to save memory, we do not store the trajectory
 import os, argparse, numpy as np
 import matplotlib
-matplotlib.use("Agg")  # use on cluster
+matplotlib.use("Agg")  # headless on clusters
 import jax
 import jax.numpy as jnp
 from jax import random, lax, jit
 
-# ---- helper functions -----
+# ---------------- Helpers
 def norm_last(x, eps=1e-7):
     nrm = jnp.linalg.norm(x, axis=-1, keepdims=True)
     return x / jnp.maximum(nrm, eps)
@@ -20,7 +20,7 @@ def softmax_last(a):
 
 def log_map_sphere_generic(U, X, eps=1e-7):
     """
-    U: (..., d)      center(s) on S^{d-1}
+    U: (..., d)      base points on S^{d-1}
     X: (..., n, d)   points on S^{d-1}, same leading dims as U
     -> (..., n, d)   tangent rows at U toward each point in X
     """
@@ -50,8 +50,6 @@ def intrinsic_mean_refine_runs_per_agent(M_agents, X_runs_agents, iters=1, step=
     X_runs_agents: (R, n, d)   points across runs for each agent
     Returns: (n, d)
     """
-    # Arrange to (..., n, d) with ... = (n,) centers — we want, for each agent i,
-    # center U[i] toward R points X_runs_agents[:, i, :]
     Xnr = jnp.swapaxes(X_runs_agents, 0, 1)  # (n, R, d)
     def one_step(Uc):
         V = log_map_sphere_generic(Uc, Xnr)   # Uc: (n,d), Xnr: (n,R,d) -> (n,R,d)
@@ -64,7 +62,7 @@ def intrinsic_mean_refine_runs_per_agent(M_agents, X_runs_agents, iters=1, step=
 
 def intrinsic_mean_refine_agents_per_run(U_run, X_agents, iters=1, step=1.0):
     """
-    Refine per-run mean across *agents*.
+    Refine per-run mean across agents.
     U_run: (R, d)
     X_agents: (R, n, d)
     Returns: (R, d)
@@ -86,7 +84,8 @@ def geodesic_diameter_points(P):
     Theta = jnp.arccos(G)
     return jnp.max(Theta)
 
-# dynamics
+# ---------------- Drift dynamics (same as your attention-style) ----------------
+
 def dynamics_batched(X, b=1.0, Q=None, K=None, Vmat=None):
     """
     X: (R, n, d) -> tangent field (R, n, d)
@@ -101,12 +100,13 @@ def dynamics_batched(X, b=1.0, Q=None, K=None, Vmat=None):
     XV = X @ V.T
     inner = XQ @ jnp.swapaxes(XK, -1, -2)   # (R,n,n)
     w = softmax_last(b * inner)             # (R,n,n)
-    Vt = w @ XV                              # (R,n,d)
+    Vt = w @ XV                             # (R,n,d)
 
     proj = jnp.sum(Vt * X, axis=-1, keepdims=True) * X
     return Vt - proj
 
-# ---------------- computes first-hit (to threshold) time of a mean trajectory on cluster
+# ---------------- Online mean-trajectory first-hit (no big storage) -----------
+
 def mean_traj_first_hit_online(
     n, d, T, dt, b, sigma0,
     runs=100,
@@ -116,11 +116,12 @@ def mean_traj_first_hit_online(
     mean_refine_steps=2,
     init_seed=30, noise_seed=1000,
     NOISE_SCHEME="angle_to_run_mean",   # "angle_to_run_mean" or "isotropic"
+    ensemble_shared_theta=False,        # toggle shared amplitude
     Q=None, K=None, Vmat=None
 ):
     """
     Simulate R runs; keep two means:
-      - U_run (R,d): per-run mean across agents, used for noise amplitude if desired
+      - U_run (R,d): per-run mean across agents, used for noise amplitude
       - M_agents (n,d): intrinsic mean across runs per agent (the *mean trajectory*)
     At every 'check_stride', refine M_agents and check geodesic diameter.
     Returns: (t_hit: float32, converged: bool)
@@ -133,45 +134,59 @@ def mean_traj_first_hit_online(
     key_init  = random.PRNGKey(init_seed)
     key_noise = random.PRNGKey(noise_seed)
 
-    # shared X0 across runs 
+    # shared X0 across runs
     x0 = random.normal(key_init, (n, d), dtype=jnp.float32)
     X0 = norm_last(jnp.broadcast_to(x0, (runs, n, d)))  # (R,n,d)
 
-    # Initialize U_run at t=0: per-run strict mean across agents (a few steps)
-    U0 = jnp.mean(X0, axis=1)
-    U0 = norm_last(U0)
-    U0 = intrinsic_mean_refine_agents_per_run(U0, X0, iters=5, step=1.0)  # warm start, strict solve
-    # Initialize M_agents at t=0: strict intrinsic mean across runs per agent
-    # do so in small batches
-    M0 = intrinsic_mean_refine_runs_per_agent(jnp.mean(jnp.swapaxes(X0,0,1), axis=-2),  # (n,d) euclid start
-                                              X0, iters=10, step=1.0)
+    # Initialize U_run at t=0
+    U0 = norm_last(jnp.mean(X0, axis=1))
+    U0 = intrinsic_mean_refine_agents_per_run(U0, X0, iters=5, step=1.0)
+
+    # Initialize M_agents at t=0
+    M0 = intrinsic_mean_refine_runs_per_agent(
+        jnp.mean(jnp.swapaxes(X0, 0, 1), axis=-2),  # (n,d) Euclidean start
+        X0, iters=10, step=1.0
+    )
+
     # carry: X, U_run, M_agents, key, t_hit, done
-    t0   = jnp.array(jnp.inf, dtype=jnp.float32)
-    done0= jnp.array(False)
+    t0    = jnp.array(jnp.inf, dtype=jnp.float32)
+    done0 = jnp.array(False)
+
+    # JAX boolean predicate for shared amplitude (closed over inside jit)
+    use_shared = jnp.array(bool(ensemble_shared_theta), dtype=jnp.bool_)
+
+    R = X0.shape[0]  # static (Python int) — used for broadcasting shapes
 
     def step_fn(carry, k):
         X, U, M, key, t_hit, done = carry
 
-        # --- Deterministic part
+        # --- Drift
         dX = dynamics_batched(X, b=b32, Q=Q, K=K, Vmat=Vmat)
 
-        # --- Noise part
+        # --- Noise (tangent)
         key, sk = random.split(key)
         rnd = random.normal(sk, X.shape, dtype=jnp.float32)
         proj = jnp.sum(rnd * X, axis=-1, keepdims=True) * X
         noise_tan = rnd - proj
 
-        if NOISE_SCHEME == "angle_to_run_mean":
-            # amplitude depends on geodesic angle to the per-run mean U (R,d)
-            c = jnp.clip(jnp.sum(X * U[:, None, :], axis=-1), -1.0, 1.0)  # (R,n)
-            theta = jnp.arccos(c)[..., None]                               # (R,n,1)
-            amp = sigma32 * theta
-        else:
-            amp = sigma32
+        # amplitude depends on geodesic angle to the per-run mean U (R,d)
+        c     = jnp.clip(jnp.sum(X * U[:, None, :], axis=-1), -1.0, 1.0)  # (R,n)
+        theta = jnp.arccos(c)                                             # (R,n)
+
+        def per_run_amp(th):
+            return sigma32 * th[..., None]                                # (R,n,1)
+
+        def shared_amp(th):
+            theta_bar = jnp.mean(th, axis=0, keepdims=True)               # (1,n)
+            amp1 = sigma32 * theta_bar[..., None]                          # (1,n,1)
+            # broadcast to match (R,n,1) so both branches have identical shape
+            return jnp.broadcast_to(amp1, (R, th.shape[1], 1))            # (R,n,1)
+
+        amp = lax.cond(use_shared, shared_amp, per_run_amp, theta)        # (R,n,1)
 
         X_next = norm_last(X + dt32 * dX + sqrt_dt * (amp * noise_tan))
 
-        # --- at mean_update_stride steps, update U_run (per-run mean across agents) for noise
+        # --- Occasionally update U_run (per-run mean across agents) for noise
         def do_mean_U(U_in):
             return intrinsic_mean_refine_agents_per_run(U_in, X_next, iters=1, step=1.0)
         do_u = (k % mean_update_stride) == 0
@@ -209,7 +224,8 @@ def mean_traj_first_hit_online(
     t_hit, done = run()
     return float(t_hit), bool(done)
 
-# ---------------- CLI and main (sharded sweep; saves data in NPZ files per shard)
+# ---------------- CLI / main (sharded sweep; saves NPZ like before) ----------
+
 def parse_args():
     ap = argparse.ArgumentParser()
     # Dynamics / geometry
@@ -226,14 +242,18 @@ def parse_args():
     ap.add_argument("--bins", type=int, default=100)
     ap.add_argument("--sigma_idx", type=int, required=True)
 
-    # Work partitioning 
+    # Work partitioning (shards)
     ap.add_argument("--tot_inits", type=int, default=100)
     ap.add_argument("--runs_per_init", type=int, default=100)
     ap.add_argument("--inits_per_task", type=int, required=True)
     ap.add_argument("--shard_idx", type=int, required=True)
 
-    # Intrinsic mean & check controls
-    ap.add_argument("--check_stride", type=int, default=50)
+    # Mean-field noise toggle
+    ap.add_argument("--ensemble_shared_theta", type=int, default=0,
+                    help="If 1, use ensemble-averaged per-agent angle for noise")
+
+    # Intrinsic mean / check controls
+    ap.add_argument("--check_stride", type=int, default=10)
     ap.add_argument("--mean_update_stride", type=int, default=5)
     ap.add_argument("--mean_refine_steps", type=int, default=2)
 
@@ -276,7 +296,8 @@ def main():
             mean_refine_steps=args.mean_refine_steps,
             init_seed=args.init_seed + i_global,
             noise_seed=args.noise_seed + i_global,
-            NOISE_SCHEME="angle_to_run_mean",  # since we want per-agent noise
+            NOISE_SCHEME="angle_to_run_mean",
+            ensemble_shared_theta=bool(args.ensemble_shared_theta),
             Q=None, K=None, Vmat=None
         )
         init_indices.append(i_global)
@@ -322,27 +343,15 @@ def main():
         check_stride=np.int32(args.check_stride),
         mean_update_stride=np.int32(args.mean_update_stride),
         mean_refine_steps=np.int32(args.mean_refine_steps),
+        ensemble_shared_theta=np.int32(1 if args.ensemble_shared_theta else 0),
     )
     print(f"[OK] Saved shard: {path} (σ={sigma0:.6f}, inits {start}..{end-1}, "
           f"min={shard_min_time:.6g}, median={shard_median_time:.6g}, max={shard_max_time:.6g})")
 
-# --------------Deprecated-------------
-# stored the full trajectory data (kept, runs, n, d) per init and then
-# computed the mean-trajectory consensus. 
-"""
-def simulate_intrinsic_noise_jax(...):
-    # returns traj_kept: (kept, runs, n, d)
-    ...
 
-def consensus_time_of_mean_trajectory(traj_kept, dt, store_stride, threshold):
-    # builds mean_traj (kept, n, d) and finds first stored time with diameter <= threshold
-    ...
-"""
-
-# ------------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # keep jax on cpu, no gpu modules needed for now
+    # Use jax on CPU
     os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
     os.environ.setdefault("JAX_ENABLE_X64", "0")
     main()

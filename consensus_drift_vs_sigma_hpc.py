@@ -156,7 +156,7 @@ def simulate_intrinsic_noise_jax(n, d, T, dt, b, sigma0,
             theta = jnp.arccos(c)[..., None]                                   # (R,n,1)
             amp = sigma0_ * theta
 
-            X_next = X + dt32 * dX + sqrt_dt * (amp * noise_tan)
+            X_next = X + dt32 * (dX - 0.5*amp**2*(d-1)*X) + sqrt_dt * (amp * noise_tan)
             X_next = norm_last(X_next)
 
             store_now = ((k + 1) % store_stride == 0) | (k == steps - 1)
