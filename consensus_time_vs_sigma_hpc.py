@@ -184,7 +184,7 @@ def mean_traj_first_hit_online(
 
         amp = lax.cond(use_shared, shared_amp, per_run_amp, theta)        # (R,n,1)
 
-        X_next = norm_last(X + dt32 * dX + sqrt_dt * (amp * noise_tan))
+        X_next = norm_last(X + dt32 * (dX - 0.5*amp**2*(d-1)*X) + sqrt_dt * (amp * noise_tan))
 
         # --- Occasionally update U_run (per-run mean across agents) for noise
         def do_mean_U(U_in):
