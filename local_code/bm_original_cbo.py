@@ -1,37 +1,40 @@
 # Attention-style consensus dynamics on S^{d-1}, noise versus deterministic.
-# Here in the noise calculation, we use amp to control the strength of the noise, and amp is calculated by d(xi, C) where C is the intrinsic mean (we use the same C across particles). 
+# Here in the noise calculation, we use amp to control the strength of the noise, and amp is
+# calculated by d(xi, C) where C is the intrinsic mean (we use the same C across particles).
 #
 # Plots:
 #   (1) Convergence: max pairwise geodesic distance across agents vs time
-#       — aggregated over runs (mean with 10–90% band) in *degrees*, log-scale in y-axis.
+#       — but now computed only for the per-agent *mean* configuration (intrinsic mean over runs).
 #   (2) Per-particle mean trajectories (mean over runs)
-# Remarks: Need to tweak the TMAX deterministic run dependeing on params. Right now, in comparing the noisy vs. deterministic the deterministic consensus is computed with its own cutoff time.
+# Remarks: Need to tweak the TMAX deterministic run depending on params. Right now, in comparing
+# the noisy vs. deterministic the deterministic consensus is computed with its own cutoff time.
 # Diagnostic: prints the deviation of the trajectory from S^{d-1}: dev = abs(norm-1)
+
 import os
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
-from mpl_toolkits.mplot3d import Axes3D  
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 # Platform (CPU)
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
-os.environ.setdefault("JAX_ENABLE_X64", "0")  
+os.environ.setdefault("JAX_ENABLE_X64", "0")
 
 import jax
 import jax.numpy as jnp
 from jax import random, lax
 
-N_AGENTS   = 32
+N_AGENTS   = 3
 DIM        = 3
-BETA       = 1.0
+BETA       = 2.0
 DT         = 1e-3
-TMAX       = 100.0
-THRESHOLD  = 1e-3
-SIGMA      = 0.5  
+TMAX       = 200.0
+THRESHOLD  = 1e-2           # in radians
+SIGMA      = 1.8
 RUNS       = 100
 STORE_STRIDE = 10
-MEAN_UPDATE_STRIDE = 5    
-MEAN_REFINE_STEPS  = 2    
+MEAN_UPDATE_STRIDE = 5
+MEAN_REFINE_STEPS  = 2
 INIT_SEED  = 201
 NOISE_SEED = 999
 
@@ -155,7 +158,7 @@ def simulate_intrinsic_noise_jax(n, d, T, dt, b, sigma0,
             # Deterministic part
             dX = dynamics_batched(X, b=b32)
 
-            # Refine the run-wise mean U every few steps 
+            # Refine the run-wise mean U every few steps
             def refine(U_in):
                 def one_refine(u):
                     V  = _log_map_batch_at_u(u, X)   # (R,n,d)
@@ -174,24 +177,21 @@ def simulate_intrinsic_noise_jax(n, d, T, dt, b, sigma0,
             do_update_C = (k % MEAN_UPDATE_STRIDE) == 0
             C_used = lax.cond(do_update_C, recompute_C, lambda _: C_cache, operand=None)  # (R,d)
 
-            # Tangent Gaussian noise 
+            # Tangent Gaussian noise
             key, sk = random.split(key)
             rnd = random.normal(sk, X.shape, dtype=jnp.float32)
             proj = jnp.sum(rnd * X, axis=-1, keepdims=True) * X
             noise_tan = rnd - proj
-            
+
             c_i = jnp.clip(jnp.sum(X * C_used[:, None, :], axis=-1, keepdims=True), -1.0, 1.0)  # (R,n,1)
             theta_i = jnp.arccos(c_i)                                                           # (R,n,1)
             amp = sigma0_ * theta_i                                                             # (R,n,1)
-            amp = sigma0_
 
-            # Ito correction 
+            # Ito correction
             X_next = X + dt32 * (dX - 0.5 * (amp**2) * (d - 1) * X) \
                        + sqrt_dt * (amp * noise_tan)
             X_next = norm_last(X_next)
-            
 
-           
             C_next = C_used
 
             # Store at stride
@@ -238,6 +238,73 @@ def diameter_time_series_deg_jax(traj_kept):
     p90 = jnp.quantile(diam_deg, 0.90, axis=1, method="linear")
     return diam_deg, mean_diam, p10, p90
 
+# NEW: diameter over agents of the *per-agent mean* configuration (numpy; 1 curve only)
+def diameter_mean_config_series_deg(M_agents_np):
+    """
+    M_agents_np: (kept, n, d) — per-agent intrinsic means over runs at each time.
+    Returns: diam_mean_deg: (kept,) — diameter of {m_i(t_k)}_i in degrees.
+    """
+    kept, n, d = M_agents_np.shape
+    diam = np.empty(kept, dtype=float)
+    for k in range(kept):
+        X = M_agents_np[k]            # (n,d)
+        G = np.clip(X @ X.T, -1.0, 1.0)
+        angles = np.arccos(G)
+        diam[k] = np.max(angles)
+    return np.degrees(diam)
+
+# NEW: robust convergence check for the per-agent mean configuration
+def robust_mean_config_convergence(diam_deg, times, thr_deg,
+                                   window_min=10, stay_below_rest=True):
+    """
+    diam_deg: (kept,) diameter of mean configuration in degrees
+    times   : (kept,) corresponding times
+    thr_deg : convergence threshold in degrees
+    window_min: # of consecutive stored frames that must be below threshold
+    stay_below_rest: if True, require it never goes back above threshold afterwards
+
+    Returns a dict with:
+      - converged       : bool (our final verdict)
+      - t_hit           : first time the window criterion is satisfied (or None)
+      - hit_idx         : index of that time (or None)
+      - stays_below     : bool, whether it ever went back above after hit_idx
+      - below           : boolean mask (diam_deg <= thr_deg)
+    """
+    diam_deg = np.asarray(diam_deg)
+    times    = np.asarray(times)
+    below    = diam_deg <= thr_deg
+    kept     = diam_deg.shape[0]
+
+    hit_idx = None
+    for k in range(0, kept - window_min + 1):
+        if np.all(below[k:k+window_min]):
+            hit_idx = k
+            break
+
+    if hit_idx is None:
+        return {
+            "converged": False,
+            "t_hit": None,
+            "hit_idx": None,
+            "stays_below": False,
+            "below": below,
+        }
+
+    # After first sustained hit, does it ever go back above?
+    stays_below = not np.any(~below[hit_idx:])
+    if stay_below_rest:
+        converged = stays_below
+    else:
+        converged = True
+
+    return {
+        "converged": converged,
+        "t_hit": float(times[hit_idx]),
+        "hit_idx": hit_idx,
+        "stays_below": stays_below,
+        "below": below,
+    }
+
 # mean trajectory over runs using stored U_kept (each U is already per-run agent mean)
 def mean_trajectory_over_runs_from_U(U_kept):
     # U_kept: (kept, R, d)
@@ -251,6 +318,7 @@ def mean_trajectories_per_agent_jax(traj_kept):
         Xi, 1e-10, 100
     )  # (kept*n, d)
     return means.reshape(kept, n, d)
+
 # PCA
 def pca_project_3d_global(points_Kxd):
     mu = points_Kxd.mean(axis=0, keepdims=True)
@@ -266,7 +334,6 @@ def main():
     init_key  = random.PRNGKey(INIT_SEED)
 
     # Deterministic (sigma=0) for reference
-    # * Need to tweek TMAX for every different parameter setting
     traj_det, U_det = simulate_intrinsic_noise_jax(
         n=N_AGENTS, d=DIM, T=TMAX*5, dt=DT, b=BETA, sigma0=0.0,
         runs=1, mean_refine_steps=MEAN_REFINE_STEPS,
@@ -286,13 +353,9 @@ def main():
         same_init_across_runs=True
     )
 
-    # --- Convergence curve in degrees (JAX) ---
+    # Per-run diameters (still used for text diagnostics, but not for plotting)
     diam_deg, mean_diam_deg, p10_deg, p90_deg = diameter_time_series_deg_jax(traj_noisy)
     diam_deg_np = np.array(diam_deg)
-    mean_diam_deg_np = np.array(mean_diam_deg)
-    p10_deg_np = np.array(p10_deg)
-    p90_deg_np = np.array(p90_deg)
-
     kept = diam_deg_np.shape[0]
     times = np.arange(kept, dtype=float) * (STORE_STRIDE * DT)
     times[-1] = TMAX
@@ -300,10 +363,10 @@ def main():
     # --- Mean trajectory over runs (from stored U_noisy) ---
     M_global = np.array(mean_trajectory_over_runs_from_U(U_noisy))  # (kept, d)
 
-    # --- Per-agent mean trajectories 
+    # --- Per-agent mean trajectories ---
     M_agents = np.array(mean_trajectories_per_agent_jax(traj_noisy))  # (kept, n, d)
 
-    # --- Drift vs deterministic point  ---
+    # --- Drift vs deterministic point ---
     drift = geodesic_angle_np(u_det, M_global[-1])
     drift_deg = np.degrees(drift)
 
@@ -325,14 +388,46 @@ def main():
     MAX_DEV = 5e-4
     assert np.all(np.abs(np.linalg.norm(traj_noisy, axis=-1) - 1.0) < MAX_DEV), \
         "Some raw states deviate from unit sphere more than tolerance."
-    assert np.all(np.abs(np.linalg.norm(M_agents,    axis=-1) - 1.0) < MAX_DEV), \
+    assert np.all(np.abs(np.linalg.norm(M_agents, axis=-1) - 1.0) < MAX_DEV), \
         "Some per-agent means deviate from unit sphere more than tolerance."
 
     # ---------- Optional visual-only re-normalization before plotting ----------
     M_agents = M_agents / np.maximum(np.linalg.norm(M_agents, axis=-1, keepdims=True), 1e-12)
     M_global = M_global / max(np.linalg.norm(M_global[-1]), 1e-12)
 
-    # --- Print consensus (first time the diameter crosses the threshold) ---
+    # --- Diameter of per-agent mean configuration (this is what we plot) ---
+    diam_mean_deg_np = diameter_mean_config_series_deg(M_agents)
+
+    # --- Robust convergence check for the mean configuration (NEW) ---
+    thr_mean_deg = np.degrees(THRESHOLD)  # same threshold, but in degrees
+    conv_info = robust_mean_config_convergence(
+        diam_mean_deg_np,
+        times,
+        thr_mean_deg,
+        window_min=10,           # 10 stored frames in a row
+        stay_below_rest=True     # require it never goes back above
+    )
+
+    if conv_info["converged"]:
+        print(
+            "[mean-config convergence] Converged robustly: "
+            f"diameter ≤ {thr_mean_deg:.3f}° starting at t≈{conv_info['t_hit']:.6g}, "
+            "and it stayed below afterwards."
+        )
+    else:
+        if conv_info["hit_idx"] is None:
+            print(
+                "[mean-config convergence] Never had a sustained window "
+                f"(length {10}) where diameter ≤ {thr_mean_deg:.3f}°."
+            )
+        else:
+            print(
+                "[mean-config convergence] Hit threshold around "
+                f"t≈{conv_info['t_hit']:.6g} but diameter later went back above; "
+                "treating this as *not* converged."
+            )
+
+    # --- Print consensus (first time any run crosses the threshold) ---
     diam_rad_per_time_run = np.array(_diam_per_time(traj_noisy))
     thr_rad = THRESHOLD
 
@@ -341,7 +436,7 @@ def main():
         if hits.size > 0:
             t_idx = int(hits[0])
             t_hit = times[t_idx]
-            consensus_vec = np.array(U_noisy)[t_idx, 0]  # per-run intrinsic mean at hit time
+            consensus_vec = np.array(U_noisy)[t_idx, 0]
             print(f"[consensus] Converged (≤ {np.degrees(thr_rad):.3f}°) at t={t_hit:.6g}. "
                   f"Consensus ≈ {consensus_vec}")
         else:
@@ -367,26 +462,25 @@ def main():
             print(f"[consensus] No runs reached the threshold by T={TMAX}.")
 
     # PLOTTING
+    # Softer color for the global mean trajectory
+    global_mean_color = "tab:purple"
 
-    # (1) Convergence plot (degrees, log y)
+    # (1) Convergence plot: diameter of per-agent mean configuration (degrees, log y)
     eps_deg = 1e-6
-    yl = np.clip(mean_diam_deg_np, eps_deg, None)
-    y10 = np.clip(p10_deg_np, eps_deg, None)
-    y90 = np.clip(p90_deg_np, eps_deg, None)
+    yl = np.clip(diam_mean_deg_np, eps_deg, None)
 
     fig1, ax1 = plt.subplots(figsize=(7.6, 4.8))
-    ax1.plot(times, yl, label="Mean diameter (deg)", linewidth=2.0)
-    ax1.fill_between(times, y10, y90, alpha=0.25, label="10-90% band", linewidth=0.0)
+    ax1.plot(times, yl, label="Diameter of per-agent means (deg)", linewidth=2.0)
     ax1.axhline(np.degrees(THRESHOLD), linestyle="--", linewidth=1.25, label="Threshold (deg)")
     ax1.set_yscale("log")
     ax1.set_xlabel("Time")
     ax1.set_ylabel("Max pairwise geodesic distance (deg) [log]")
-    ax1.set_title("Convergence: geodesic diameter (degrees, log scale)")
+    ax1.set_title("Convergence of per-agent mean configuration (degrees, log scale)")
     ax1.legend(loc="upper right")
     ax1.grid(True, which="both", linestyle=":", linewidth=0.7)
     ax1.xaxis.set_major_locator(MaxNLocator(8))
 
-    # (2) Per-particle mean trajectories 
+    # (2) Per-particle mean trajectories
     cmap = plt.cm.get_cmap("tab20", N_AGENTS)
 
     if DIM == 3:
@@ -399,28 +493,76 @@ def main():
         xs = np.outer(np.cos(u), np.sin(v))
         ys = np.outer(np.sin(u), np.sin(v))
         zs = np.outer(np.ones_like(u), np.cos(v))
-        ax2.plot_wireframe(xs, ys, zs, linewidth=0.25, alpha=0.35)
+        ax2.plot_wireframe(xs, ys, zs, linewidth=0.25, alpha=0.25)
 
+        # Per-agent intrinsic mean trajectories over runs
         for i in range(N_AGENTS):
             curve = M_agents[:, i, :]  # (kept, 3)
             color_i = cmap(i % cmap.N)
-            ax2.plot(curve[:,0], curve[:,1], curve[:,2],
-                     linewidth=1.8, alpha=0.95, color=color_i)
-            # haloed cross at end
-            ax2.plot([curve[-1,0]], [curve[-1,1]], [curve[-1,2]],
-                     marker="x", markersize=11, mew=3.0, color="white",
-                     linestyle="None", zorder=10)
-            ax2.plot([curve[-1,0]], [curve[-1,1]], [curve[-1,2]],
-                     marker="x", markersize=8,  mew=1.8, color=color_i,
-                     linestyle="None", zorder=11)
 
-        ax2.set_box_aspect([1,1,1])
-        ax2.set_xlim([-1.05, 1.05]); ax2.set_ylim([-1.05, 1.05]); ax2.set_zlim([-1.05, 1.05])
-        ax2.set_xlabel("x"); ax2.set_ylabel("y"); ax2.set_zlabel("z")
+            # slightly more transparent lines to de-noise the picture
+            label_line = "Per-agent mean trajectory" if i == 0 else None
+            ax2.plot(
+                curve[:, 0], curve[:, 1], curve[:, 2],
+                linewidth=1.4, alpha=0.5, color=color_i,
+                label=label_line,
+            )
+
+            # haloed cross at final position for agent i
+            ax2.plot(
+                [curve[-1, 0]], [curve[-1, 1]], [curve[-1, 2]],
+                marker="x", markersize=11, mew=3.0, color="white",
+                linestyle="None", zorder=10,
+            )
+            ax2.plot(
+                [curve[-1, 0]], [curve[-1, 1]], [curve[-1, 2]],
+                marker="x", markersize=8, mew=1.8, color=color_i,
+                linestyle="None", zorder=11,
+                label="Final per-agent mean (×)" if i == 0 else None,
+            )
+
+        # Global mean trajectory over runs (using U_noisy)
+        ax2.plot(
+            M_global[:, 0], M_global[:, 1], M_global[:, 2],
+            linestyle="--", linewidth=2.3, color=global_mean_color, alpha=0.9,
+            label="Global mean over runs",
+        )
+        ax2.plot(
+            [M_global[-1, 0]], [M_global[-1, 1]], [M_global[-1, 2]],
+            marker="o", markersize=8, color=global_mean_color,
+            linestyle="None", zorder=12,
+            label="Final global mean",
+        )
+
+        # Deterministic consensus direction (sigma = 0)
+        ax2.plot(
+            [u_det[0]], [u_det[1]], [u_det[2]],
+            marker="*", markersize=10, color="0.4",
+            linestyle="None", zorder=13,
+            label="Deterministic consensus (σ=0)",
+        )
+
+        ax2.set_box_aspect([1, 1, 1])
+        ax2.set_xlim([-1.05, 1.05])
+        ax2.set_ylim([-1.05, 1.05])
+        ax2.set_zlim([-1.05, 1.05])
+        ax2.set_xlabel("x")
+        ax2.set_ylabel("y")
+        ax2.set_zlabel("z")
+
         dev_agents = np.abs(np.linalg.norm(M_agents, axis=-1) - 1.0).max()
-        ax2.set_title(f"Per-particle mean trajectories on $S^2$ (end = x)\nmax dev |‖·‖-1| = {dev_agents:.2e}")
-        ax2.xaxis.pane.fill = False; ax2.yaxis.pane.fill = False; ax2.zaxis.pane.fill = False
+        ax2.set_title(
+            "Per-agent intrinsic mean trajectories on $S^2$\n"
+            "Lines: per-agent mean; ×: final per-agent mean;\n"
+            "Dashed line: global mean; ●: final global mean; ★: deterministic consensus\n"
+            f"max dev |‖·‖-1| = {dev_agents:.2e}"
+        )
+
+        ax2.xaxis.pane.fill = False
+        ax2.yaxis.pane.fill = False
+        ax2.zaxis.pane.fill = False
         ax2.grid(False)
+        ax2.legend(loc="upper left")
 
     else:
         all_points = M_agents.reshape(-1, DIM)  # (kept*n, d)
@@ -429,23 +571,63 @@ def main():
         fig2 = plt.figure(figsize=(7.4, 7.0))
         ax2 = fig2.add_subplot(111, projection="3d")
 
+        # Project global mean and deterministic consensus
+        M_global3 = proj(M_global)           # (kept, 3)
+        u_det3    = proj(u_det[None, :])[0]  # (3,)
+
         for i in range(N_AGENTS):
             curve_d = M_agents[:, i, :]        # (kept,d)
             curve3  = proj(curve_d)            # (kept,3)
             color_i = cmap(i % cmap.N)
-            ax2.plot(curve3[:,0], curve3[:,1], curve3[:,2],
-                     linewidth=1.8, alpha=0.95, color=color_i)
-            # haloed cross at end
-            ax2.plot([curve3[-1,0]], [curve3[-1,1]], [curve3[-1,2]],
-                     marker="x", markersize=11, mew=3.0, color="white",
-                     linestyle="None", zorder=10)
-            ax2.plot([curve3[-1,0]], [curve3[-1,1]], [curve3[-1,2]],
-                     marker="x", markersize=8,  mew=1.8, color=color_i,
-                     linestyle="None", zorder=11)
 
-        ax2.set_box_aspect([1,1,1])
-        ax2.set_title("Per-particle mean trajectories (PCA->3D, end = x)")
+            label_line = "Per-agent mean trajectory" if i == 0 else None
+            ax2.plot(
+                curve3[:, 0], curve3[:, 1], curve3[:, 2],
+                linewidth=1.4, alpha=0.5, color=color_i,
+                label=label_line,
+            )
+            # haloed cross at end
+            ax2.plot(
+                [curve3[-1, 0]], [curve3[-1, 1]], [curve3[-1, 2]],
+                marker="x", markersize=11, mew=3.0, color="white",
+                linestyle="None", zorder=10,
+            )
+            ax2.plot(
+                [curve3[-1, 0]], [curve3[-1, 1]], [curve3[-1, 2]],
+                marker="x", markersize=8, mew=1.8, color=color_i,
+                linestyle="None", zorder=11,
+                label="Final per-agent mean (×)" if i == 0 else None,
+            )
+
+        # Global mean trajectory (PCA-projected)
+        ax2.plot(
+            M_global3[:, 0], M_global3[:, 1], M_global3[:, 2],
+            linestyle="--", linewidth=2.3, color=global_mean_color, alpha=0.9,
+            label="Global mean over runs",
+        )
+        ax2.plot(
+            [M_global3[-1, 0]], [M_global3[-1, 1]], [M_global3[-1, 2]],
+            marker="o", markersize=8, color=global_mean_color,
+            linestyle="None", zorder=12,
+            label="Final global mean",
+        )
+
+        # Deterministic consensus (PCA-projected)
+        ax2.plot(
+            [u_det3[0]], [u_det3[1]], [u_det3[2]],
+            marker="*", markersize=10, color="0.4",
+            linestyle="None", zorder=13,
+            label="Deterministic consensus (σ=0)",
+        )
+
+        ax2.set_box_aspect([1, 1, 1])
+        ax2.set_title(
+            "Per-agent intrinsic mean trajectories (PCA → 3D)\n"
+            "Lines: per-agent mean; ×: final per-agent mean;\n"
+            "Dashed line: global mean; ●: final global mean; ★: deterministic consensus"
+        )
         ax2.grid(False)
+        ax2.legend(loc="upper left")
 
     # ---- Print summary & show ----
     print("\n=== SUMMARY ===")

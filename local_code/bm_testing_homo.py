@@ -1,37 +1,38 @@
 # Attention-style consensus dynamics on S^{d-1}, noise versus deterministic.
-# Here in the noise calculation, we use amp to control the strength of the noise, and amp is calculated by d(xi, C) where C is the intrinsic mean (we use the same C across particles). 
+# Here in the noise calculation, we use a constant amplitude sigma0 (no distance-to-C scaling).
 #
 # Plots:
 #   (1) Convergence: max pairwise geodesic distance across agents vs time
 #       — aggregated over runs (mean with 10–90% band) in *degrees*, log-scale in y-axis.
 #   (2) Per-particle mean trajectories (mean over runs)
-# Remarks: Need to tweak the TMAX deterministic run dependeing on params. Right now, in comparing the noisy vs. deterministic the deterministic consensus is computed with its own cutoff time.
 # Diagnostic: prints the deviation of the trajectory from S^{d-1}: dev = abs(norm-1)
+
 import os
+import math
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
-from mpl_toolkits.mplot3d import Axes3D  
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 # Platform (CPU)
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
-os.environ.setdefault("JAX_ENABLE_X64", "0")  
+os.environ.setdefault("JAX_ENABLE_X64", "0")
 
 import jax
 import jax.numpy as jnp
 from jax import random, lax
 
-N_AGENTS   = 32
+N_AGENTS   = 100
 DIM        = 3
 BETA       = 1.0
-DT         = 1e-3
-TMAX       = 100.0
+DT         = 1e-2
+TMAX       = 200.0
 THRESHOLD  = 1e-3
-SIGMA      = 0.1    
-RUNS       = 100
+SIGMA      = 0.25
+RUNS       = 50
 STORE_STRIDE = 10
-MEAN_UPDATE_STRIDE = 5    
-MEAN_REFINE_STEPS  = 2    
+MEAN_UPDATE_STRIDE = 5
+MEAN_REFINE_STEPS  = 2
 INIT_SEED  = 201
 NOISE_SEED = 999
 
@@ -84,30 +85,89 @@ def intrinsic_mean_sd_jax(points, tol=1e-10, max_iter=100):
     Returns u: (d,)
     """
     u0 = norm_last(jnp.mean(points, axis=0))
+
     def cond_fun(state):
         u, g, k = state
         return jnp.logical_and(jnp.linalg.norm(g) > tol, k < max_iter)
+
     def body_fun(state):
         u, g, k = state
         V  = _log_map_batch_at_u(u, points)
         g2 = jnp.mean(V, axis=0)
         u2 = _exp_map_at_u(u, g2)
         return (u2, g2, k+1)
+
     g0 = jnp.mean(_log_map_batch_at_u(u0, points), axis=0)
     u_final, _, _ = lax.while_loop(cond_fun, body_fun, (u0, g0, 0))
-    return norm_last(u_final)   # ensure exactly on S^{d-1}
+    return norm_last(u_final)
 
 # batched over leading axes: points: (B, m, d) -> (B, d)
 intrinsic_mean_sd_batch = jax.jit(jax.vmap(intrinsic_mean_sd_jax, in_axes=(0, None, None)))
 
-# ---------- compute C ----------------
-@jax.jit
-def compute_global_C_from_X(X, mean_refine_steps_unused):
+# ---------------------------
+# Uniform discrepancy (Formula 1)
+# Spectral/MMD discrepancy to uniform using Gegenbauer-polynomial kernel
+# ---------------------------
+def _gegenbauer_vals_all_l(t, alpha, L):
     """
-    X: (R, n, d)
-    Returns: C: (R, d) — global intrinsic (Karcher) mean per run (same for all agents)
+    Returns [C_0^{(alpha)}(t), ..., C_L^{(alpha)}(t)] for scalar t in [-1,1].
+    Recurrence:
+      (n+1) C_{n+1} = 2 (n+alpha) t C_n - (n+2alpha-1) C_{n-1}
+    Special-case d=2 => alpha=0 (Chebyshev T_n).
     """
-    return intrinsic_mean_sd_batch(X, 1e-10, 100)  # (R,d)
+    t = float(np.clip(t, -1.0, 1.0))
+
+    # d=2 => alpha=0, use Chebyshev T_n(t)=cos(n arccos t)
+    if abs(alpha) < 1e-14:
+        th = math.acos(t)
+        return [math.cos(n * th) for n in range(L + 1)]
+
+    C = [0.0] * (L + 1)
+    C[0] = 1.0
+    if L >= 1:
+        C[1] = 2.0 * alpha * t
+    for n in range(1, L):
+        C[n + 1] = (2.0 * (n + alpha) * t * C[n] - (n + 2.0 * alpha - 1.0) * C[n - 1]) / (n + 1.0)
+    return C
+
+def _gegenbauer_C_at_1(alpha, l):
+    """
+    C_l^{(alpha)}(1) = Gamma(l+2alpha) / (l! Gamma(2alpha)) for alpha>0.
+    For alpha=0 (d=2), we use Chebyshev => C_l(1)=1.
+    """
+    if abs(alpha) < 1e-14:
+        return 1.0
+    return math.gamma(l + 2.0 * alpha) / (math.factorial(l) * math.gamma(2.0 * alpha))
+
+def uniform_discrepancy_spectral(X, d, L=6, s=1.0):
+    """
+    Formula (1): spectral/MMD discrepancy to uniform on S^{d-1}
+
+      D^2 = (1/n^2) sum_{i,j} K(x_i·x_j)
+      K(t)= sum_{l=1}^L w_l * C_l^{(alpha)}(t)/C_l^{(alpha)}(1),
+      alpha=(d-2)/2, w_l=(1+lambda_l)^(-s), lambda_l=l(l+d-2).
+
+    X: (n,d) points on S^{d-1} (assumed normalized).
+    Returns: D >= 0.
+    """
+    n = X.shape[0]
+    alpha = 0.5 * (d - 2)
+
+    w = np.array([(1.0 + l * (l + d - 2)) ** (-s) for l in range(L + 1)], dtype=float)
+    w[0] = 0.0  # remove constant mode
+
+    C1 = np.array([_gegenbauer_C_at_1(alpha, l) for l in range(L + 1)], dtype=float)
+
+    G = np.clip(X @ X.T, -1.0, 1.0)
+
+    K = np.zeros_like(G, dtype=float)
+    for i in range(n):
+        for j in range(n):
+            vals = np.array(_gegenbauer_vals_all_l(G[i, j], alpha, L), dtype=float)
+            K[i, j] = float(np.sum(w * (vals / C1)))
+
+    D2 = float(np.mean(K))
+    return math.sqrt(max(D2, 0.0))
 
 # ---- Simulation (stores only at store_stride, but does not affect computation)
 def simulate_intrinsic_noise_jax(n, d, T, dt, b, sigma0,
@@ -123,8 +183,10 @@ def simulate_intrinsic_noise_jax(n, d, T, dt, b, sigma0,
     steps = int(float(T) / float(dt))
     kept  = steps // int(store_stride) + 1
 
-    if init_key is None:  init_key  = random.PRNGKey(0)
-    if noise_key is None: noise_key = random.PRNGKey(1)
+    if init_key is None:
+        init_key  = random.PRNGKey(0)
+    if noise_key is None:
+        noise_key = random.PRNGKey(1)
 
     if same_init_across_runs:
         x0 = random.normal(init_key, (n, d), dtype=jnp.float32)
@@ -132,10 +194,7 @@ def simulate_intrinsic_noise_jax(n, d, T, dt, b, sigma0,
     else:
         X0 = norm_last(random.normal(init_key, (runs, n, d), dtype=jnp.float32))
 
-    # Strong solve initially
     U0 = intrinsic_mean_sd_batch(X0, 1e-10, 100)  # (R,d)
-
-    C_cache0 = compute_global_C_from_X(X0, mean_refine_steps)  # (R,d)
 
     traj0 = (jnp.zeros((kept, runs, n, d), dtype=jnp.float32)
              .at[0].set(X0))
@@ -151,55 +210,46 @@ def simulate_intrinsic_noise_jax(n, d, T, dt, b, sigma0,
     @jax.jit
     def run():
         def step_fn(carry, k):
-            X, U, C_cache, key, traj, Ukr, frame = carry
-            # Deterministic part
+            X, U, key, traj, Ukr, frame = carry
+
             dX = dynamics_batched(X, b=b32)
 
-            # Refine the run-wise mean U every few steps 
             def refine(U_in):
                 def one_refine(u):
                     V  = _log_map_batch_at_u(u, X)   # (R,n,d)
                     g  = jnp.mean(V, axis=1)         # (R,d)
-                    def step(ui, gi): return norm_last(_exp_map_at_u(ui, gi))
+                    def step(ui, gi):
+                        return norm_last(_exp_map_at_u(ui, gi))
                     return jax.vmap(step)(u, g)
-                def body(u, _): return one_refine(u), None
+
+                def body(u, _):
+                    return one_refine(u), None
+
                 u_out, _ = lax.scan(body, U_in, xs=None, length=mean_refine_steps)
                 return u_out
 
-            do_refine = (k % MEAN_UPDATE_STRIDE) == 0
+            do_refine = (k % mean_update_stride) == 0
             U_new = lax.cond(do_refine, refine, lambda u: u, U)  # (R,d)
 
-            def recompute_C(_):
-                return compute_global_C_from_X(X, mean_refine_steps)  # (R,d)
-            do_update_C = (k % MEAN_UPDATE_STRIDE) == 0
-            C_used = lax.cond(do_update_C, recompute_C, lambda _: C_cache, operand=None)  # (R,d)
-
-            # Tangent Gaussian noise 
             key, sk = random.split(key)
             rnd = random.normal(sk, X.shape, dtype=jnp.float32)
             proj = jnp.sum(rnd * X, axis=-1, keepdims=True) * X
             noise_tan = rnd - proj
-            
-            c_i = jnp.clip(jnp.sum(X * C_used[:, None, :], axis=-1, keepdims=True), -1.0, 1.0)  # (R,n,1)
-            theta_i = jnp.arccos(c_i)                                                           # (R,n,1)
-            amp = sigma0_ * theta_i                                                             # (R,n,1)
 
-            # Ito correction 
+            amp = sigma0_
+
             X_next = X + dt32 * (dX - 0.5 * (amp**2) * (d - 1) * X) \
                        + sqrt_dt * (amp * noise_tan)
             X_next = norm_last(X_next)
-            
 
-           
-            C_next = C_used
-
-            # Store at stride
-            store_now = ((k + 1) % STORE_STRIDE == 0) | (k == steps - 1)
+            store_now = ((k + 1) % store_stride == 0) | (k == steps - 1)
 
             def store_path(args):
                 traj_in, Ukr_in, frame_in, Xsnap, Usnap = args
-                traj_out = lax.dynamic_update_slice(traj_in, Xsnap[None, ...], (frame_in, 0, 0, 0))
-                Ukr_out  = lax.dynamic_update_slice(Ukr_in, Usnap[None, ...], (frame_in, 0, 0))
+                traj_out = lax.dynamic_update_slice(traj_in, Xsnap[None, ...],
+                                                    (frame_in, 0, 0, 0))
+                Ukr_out  = lax.dynamic_update_slice(Ukr_in, Usnap[None, ...],
+                                                    (frame_in, 0, 0))
                 return traj_out, Ukr_out, frame_in + 1
 
             def skip_path(args):
@@ -209,13 +259,13 @@ def simulate_intrinsic_noise_jax(n, d, T, dt, b, sigma0,
             traj_new, Ukr_new, frame_new = lax.cond(
                 store_now, store_path, skip_path, (traj, Ukr, frame, X_next, U_new)
             )
-            return (X_next, U_new, C_next, key, traj_new, Ukr_new, frame_new), None
+            return (X_next, U_new, key, traj_new, Ukr_new, frame_new), None
 
-        carry0 = (X0, U0, C_cache0, random.PRNGKey(NOISE_SEED), traj0, Uk0, frame0)
-        (Xf, Uf, Cfin, keyf, trajf, Ukrf, framef), _ = lax.scan(
+        carry0 = (X0, U0, noise_key, traj0, Uk0, frame0)
+        (Xf, Uf, keyf, trajf, Ukrf, framef), _ = lax.scan(
             step_fn, carry0, xs=jnp.arange(steps, dtype=jnp.int32)
         )
-        return trajf, Ukrf  # (kept, R, n, d), (kept, R, d)
+        return trajf, Ukrf
 
     return run()
 
@@ -228,21 +278,16 @@ _diam_per_run  = jax.vmap(_diameter_single_set, in_axes=0)  # (R,n,d)->(R,)
 _diam_per_time = jax.vmap(_diam_per_run, in_axes=0)         # (kept,R,n,d)->(kept,R)
 
 def diameter_time_series_deg_jax(traj_kept):
-    # traj_kept: (kept, R, n, d)
     diam = _diam_per_time(traj_kept)              # (kept, R) in radians
     diam_deg = jnp.degrees(diam)
     mean_diam = jnp.mean(diam_deg, axis=1)
-    # safer than percentile on some JAX builds
     p10 = jnp.quantile(diam_deg, 0.10, axis=1, method="linear")
     p90 = jnp.quantile(diam_deg, 0.90, axis=1, method="linear")
     return diam_deg, mean_diam, p10, p90
 
-# mean trajectory over runs using stored U_kept (each U is already per-run agent mean)
 def mean_trajectory_over_runs_from_U(U_kept):
-    # U_kept: (kept, R, d)
     return intrinsic_mean_sd_batch(U_kept, 1e-10, 100)  # (kept, d)
 
-# per-agent mean trajectories (vectorized intrinsic mean over runs for each (t,i))
 def mean_trajectories_per_agent_jax(traj_kept):
     kept, R, n, d = traj_kept.shape
     Xi = jnp.transpose(traj_kept, (0, 2, 1, 3)).reshape(kept * n, R, d)  # (kept*n, R, d)
@@ -250,22 +295,23 @@ def mean_trajectories_per_agent_jax(traj_kept):
         Xi, 1e-10, 100
     )  # (kept*n, d)
     return means.reshape(kept, n, d)
-# PCA
+
 def pca_project_3d_global(points_Kxd):
     mu = points_Kxd.mean(axis=0, keepdims=True)
     X = points_Kxd - mu
     U, S, Vt = np.linalg.svd(X, full_matrices=False)
     V3 = Vt[:3].T  # (d,3)
+
     def proj(Y):
         Yc = Y - mu
         return Yc @ V3
+
     return proj
 
 def main():
     init_key  = random.PRNGKey(INIT_SEED)
 
     # Deterministic (sigma=0) for reference
-    # * Need to tweek TMAX for every different parameter setting
     traj_det, U_det = simulate_intrinsic_noise_jax(
         n=N_AGENTS, d=DIM, T=TMAX*5, dt=DT, b=BETA, sigma0=0.0,
         runs=1, mean_refine_steps=MEAN_REFINE_STEPS,
@@ -273,8 +319,7 @@ def main():
         store_stride=STORE_STRIDE, mean_update_stride=MEAN_UPDATE_STRIDE,
         same_init_across_runs=True
     )
-    traj_det_np = np.array(traj_det)  # (kept, 1, n, d)
-    u_det = np.array(U_det)[-1, 0]    # final per-run mean as deterministic direction
+    u_det = np.array(U_det)[-1, 0]
 
     # Noisy runs (shared init)
     traj_noisy, U_noisy = simulate_intrinsic_noise_jax(
@@ -299,8 +344,30 @@ def main():
     # --- Mean trajectory over runs (from stored U_noisy) ---
     M_global = np.array(mean_trajectory_over_runs_from_U(U_noisy))  # (kept, d)
 
-    # --- Per-agent mean trajectories 
+    print("[cm(mean trajectory) @ final time] =", M_global[-1])
+
+    # --- Per-agent mean trajectories (intrinsic mean over runs for each agent) ---
     M_agents = np.array(mean_trajectories_per_agent_jax(traj_noisy))  # (kept, n, d)
+
+    # --- NEW: distance to uniform for the mean configuration at final time (Formula 1) ---
+    # Mean configuration across runs at final time is X_mean_final = M_agents[-1] (shape (n,d)).
+    X_mean_final = M_agents[-1]
+    X_mean_final = X_mean_final / np.maximum(np.linalg.norm(X_mean_final, axis=-1, keepdims=True), 1e-12)
+           # --- NEW: extrinsic center of mass (equal-mass particles) ---
+    c_p = np.mean(X_mean_final, axis=0)           # (d,)
+    cp_norm = np.linalg.norm(c_p)
+
+    print(f"[center of mass] c_p = (1/n) sum_i x_i  (extrinsic)")
+    print(f"[center of mass] ||c_p|| = {cp_norm:.6e}")
+    L_DISCREP = 6   # degree cutoff: 3, 6, 10 are typical
+    S_SMOOTH  = 1.0 # weights exponent: larger emphasizes low frequencies
+
+    D_mean_final = uniform_discrepancy_spectral(X_mean_final, d=DIM, L=L_DISCREP, s=S_SMOOTH)
+
+    print(f"[uniform distance] Using formula (1): spectral/MMD (Gegenbauer kernel)")
+    print(f"[uniform distance] Applied to MEAN configuration across runs at final time (M_agents[-1])")
+    print(f"[uniform distance] Params: L={L_DISCREP}, s={S_SMOOTH}")
+    print(f"[uniform distance] D(mean-config @ final) = {D_mean_final:.6e}")
 
     # --- Drift vs deterministic point  ---
     drift = geodesic_angle_np(u_det, M_global[-1])
@@ -320,11 +387,10 @@ def main():
     _stats_unit_norm("M_global (mean over runs)", M_global, axis=-1)
     _stats_unit_norm("M_agents (per-agent mean over runs)", M_agents, axis=-1)
 
-    # Optional: assert if anything is off beyond a tight tolerance
     MAX_DEV = 5e-4
     assert np.all(np.abs(np.linalg.norm(traj_noisy, axis=-1) - 1.0) < MAX_DEV), \
         "Some raw states deviate from unit sphere more than tolerance."
-    assert np.all(np.abs(np.linalg.norm(M_agents,    axis=-1) - 1.0) < MAX_DEV), \
+    assert np.all(np.abs(np.linalg.norm(M_agents, axis=-1) - 1.0) < MAX_DEV), \
         "Some per-agent means deviate from unit sphere more than tolerance."
 
     # ---------- Optional visual-only re-normalization before plotting ----------
@@ -340,7 +406,7 @@ def main():
         if hits.size > 0:
             t_idx = int(hits[0])
             t_hit = times[t_idx]
-            consensus_vec = np.array(U_noisy)[t_idx, 0]  # per-run intrinsic mean at hit time
+            consensus_vec = np.array(U_noisy)[t_idx, 0]
             print(f"[consensus] Converged (≤ {np.degrees(thr_rad):.3f}°) at t={t_hit:.6g}. "
                   f"Consensus ≈ {consensus_vec}")
         else:
@@ -356,7 +422,7 @@ def main():
         print(f"[consensus] Converged runs: {num_conv}/{RUNS} "
               f"(threshold ≤ {np.degrees(thr_rad):.3f}°).")
         if num_conv > 0:
-            U_np = np.array(U_noisy)  # (kept, R, d)
+            U_np = np.array(U_noisy)
             cons_list = [U_np[first_idx[r], r] for r in converged_runs]
             cons_arr = np.stack(cons_list, axis=0)
             cons_global = np.array(intrinsic_mean_sd_jax(jnp.array(cons_arr)))
@@ -376,7 +442,8 @@ def main():
     fig1, ax1 = plt.subplots(figsize=(7.6, 4.8))
     ax1.plot(times, yl, label="Mean diameter (deg)", linewidth=2.0)
     ax1.fill_between(times, y10, y90, alpha=0.25, label="10-90% band", linewidth=0.0)
-    ax1.axhline(np.degrees(THRESHOLD), linestyle="--", linewidth=1.25, label="Threshold (deg)")
+    ax1.axhline(np.degrees(THRESHOLD), linestyle="--", linewidth=1.25,
+                label="Threshold (deg)")
     ax1.set_yscale("log")
     ax1.set_xlabel("Time")
     ax1.set_ylabel("Max pairwise geodesic distance (deg) [log]")
@@ -385,14 +452,13 @@ def main():
     ax1.grid(True, which="both", linestyle=":", linewidth=0.7)
     ax1.xaxis.set_major_locator(MaxNLocator(8))
 
-    # (2) Per-particle mean trajectories 
+    # (2) Per-particle mean trajectories
     cmap = plt.cm.get_cmap("tab20", N_AGENTS)
 
     if DIM == 3:
         fig2 = plt.figure(figsize=(7.4, 7.0))
         ax2 = fig2.add_subplot(111, projection="3d")
 
-        # sphere wireframe
         u = np.linspace(0, 2*np.pi, 80)
         v = np.linspace(0, np.pi, 40)
         xs = np.outer(np.cos(u), np.sin(v))
@@ -401,56 +467,58 @@ def main():
         ax2.plot_wireframe(xs, ys, zs, linewidth=0.25, alpha=0.35)
 
         for i in range(N_AGENTS):
-            curve = M_agents[:, i, :]  # (kept, 3)
+            curve = M_agents[:, i, :]
             color_i = cmap(i % cmap.N)
-            ax2.plot(curve[:,0], curve[:,1], curve[:,2],
+            ax2.plot(curve[:, 0], curve[:, 1], curve[:, 2],
                      linewidth=1.8, alpha=0.95, color=color_i)
-            # haloed cross at end
-            ax2.plot([curve[-1,0]], [curve[-1,1]], [curve[-1,2]],
+            ax2.plot([curve[-1, 0]], [curve[-1, 1]], [curve[-1, 2]],
                      marker="x", markersize=11, mew=3.0, color="white",
                      linestyle="None", zorder=10)
-            ax2.plot([curve[-1,0]], [curve[-1,1]], [curve[-1,2]],
+            ax2.plot([curve[-1, 0]], [curve[-1, 1]], [curve[-1, 2]],
                      marker="x", markersize=8,  mew=1.8, color=color_i,
                      linestyle="None", zorder=11)
 
-        ax2.set_box_aspect([1,1,1])
+        ax2.set_box_aspect([1, 1, 1])
         ax2.set_xlim([-1.05, 1.05]); ax2.set_ylim([-1.05, 1.05]); ax2.set_zlim([-1.05, 1.05])
         ax2.set_xlabel("x"); ax2.set_ylabel("y"); ax2.set_zlabel("z")
         dev_agents = np.abs(np.linalg.norm(M_agents, axis=-1) - 1.0).max()
-        ax2.set_title(f"Per-particle mean trajectories on $S^2$ (end = x)\nmax dev |‖·‖-1| = {dev_agents:.2e}")
-        ax2.xaxis.pane.fill = False; ax2.yaxis.pane.fill = False; ax2.zaxis.pane.fill = False
+        ax2.set_title(
+            f"Per-particle mean trajectories on $S^2$ (end = x)\n"
+            f"max dev |‖·‖-1| = {dev_agents:.2e}"
+        )
+        ax2.xaxis.pane.fill = False
+        ax2.yaxis.pane.fill = False
+        ax2.zaxis.pane.fill = False
         ax2.grid(False)
 
     else:
-        all_points = M_agents.reshape(-1, DIM)  # (kept*n, d)
+        all_points = M_agents.reshape(-1, DIM)
         proj = pca_project_3d_global(all_points)
 
         fig2 = plt.figure(figsize=(7.4, 7.0))
         ax2 = fig2.add_subplot(111, projection="3d")
 
         for i in range(N_AGENTS):
-            curve_d = M_agents[:, i, :]        # (kept,d)
-            curve3  = proj(curve_d)            # (kept,3)
+            curve_d = M_agents[:, i, :]
+            curve3  = proj(curve_d)
             color_i = cmap(i % cmap.N)
-            ax2.plot(curve3[:,0], curve3[:,1], curve3[:,2],
+            ax2.plot(curve3[:, 0], curve3[:, 1], curve3[:, 2],
                      linewidth=1.8, alpha=0.95, color=color_i)
-            # haloed cross at end
-            ax2.plot([curve3[-1,0]], [curve3[-1,1]], [curve3[-1,2]],
+            ax2.plot([curve3[-1, 0]], [curve3[-1, 1]], [curve3[-1, 2]],
                      marker="x", markersize=11, mew=3.0, color="white",
                      linestyle="None", zorder=10)
-            ax2.plot([curve3[-1,0]], [curve3[-1,1]], [curve3[-1,2]],
+            ax2.plot([curve3[-1, 0]], [curve3[-1, 1]], [curve3[-1, 2]],
                      marker="x", markersize=8,  mew=1.8, color=color_i,
                      linestyle="None", zorder=11)
 
-        ax2.set_box_aspect([1,1,1])
+        ax2.set_box_aspect([1, 1, 1])
         ax2.set_title("Per-particle mean trajectories (PCA->3D, end = x)")
         ax2.grid(False)
 
-    # ---- Print summary & show ----
     print("\n=== SUMMARY ===")
     print(f"n={N_AGENTS}, d={DIM}, beta={BETA}, dt={DT}, Tmax={TMAX}, threshold={THRESHOLD}")
     print(f"sigma={SIGMA}, runs={RUNS}, store_stride={STORE_STRIDE}")
-    print(f"Drift vs deterministic (rad): {drift:.6e}, (deg): {np.degrees(drift):.6e}")
+    print(f"Drift vs deterministic (rad): {drift:.6e}, (deg): {drift_deg:.6e}")
     print(f"Stored frames: {kept}")
 
     plt.tight_layout()

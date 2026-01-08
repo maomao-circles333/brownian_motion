@@ -219,6 +219,63 @@ def noisy_consensus_across_runs(traj_kept, threshold):
     V = np.vstack(vecs)
     u_noise = intrinsic_mean_Sd_np(V)
     return u_noise, len(vecs)
+def intrinsic_mean_refine_runs_per_agent_np(M_agents, X_runs_agents, iters=1, step=1.0):
+    """
+    Refine intrinsic mean across runs for each agent (NumPy version).
+    M_agents: (n, d)
+    X_runs_agents: (R, n, d)
+    Returns: (n, d)
+    """
+    R, n, d = X_runs_agents.shape
+    M = M_agents.copy()
+
+    for _ in range(iters):
+        # for each agent i, compute mean log-map over runs at base M[i]
+        G = np.zeros_like(M)
+        for i in range(n):
+            u = M[i]
+            pts = X_runs_agents[:, i, :]  # (R,d)
+            V = log_map_sphere_batch_np(u, pts)  # (R,d) tangent at u
+            g = V.mean(axis=0)                   # (d,)
+            G[i] = g
+        # exp map update per agent
+        for i in range(n):
+            M[i] = exp_map_sphere_np(M[i], step * G[i])
+    return M
+
+
+def meantraj_consensus_across_runs(traj_kept, threshold, mean_refine_steps=2, init_refine=10):
+    """
+    Mean-trajectory consensus, using stored frames.
+    traj_kept: (kept, R, n, d)
+
+    Builds mean configuration M(t) where each agent i is the intrinsic mean across runs,
+    checks diameter(M(t)) <= threshold.
+    Returns:
+      u_noise: (d,)   intrinsic mean across agents of M(t_hit) (or last M if no hit)
+      meantraj_flag:  1 if mean trajectory hit threshold, else 0
+    """
+    kept, R, n, d = traj_kept.shape
+
+    # Initialize M at t=0 using Euclidean mean across runs per agent, then refine intrinsically
+    X0 = np.array(traj_kept[0])                 # (R,n,d)
+    M0_euc = normalize_rows_np(X0.mean(axis=0)) # (n,d)
+    M = intrinsic_mean_refine_runs_per_agent_np(M0_euc, X0, iters=init_refine, step=1.0)
+
+    for t in range(kept):
+        Xt = np.array(traj_kept[t])  # (R,n,d)
+
+        # refine mean config a bit using current Xt
+        M = intrinsic_mean_refine_runs_per_agent_np(M, Xt, iters=mean_refine_steps, step=1.0)
+
+        # check diameter of mean config
+        if diameter_of_agents(M) <= threshold:
+            u_noise = intrinsic_mean_Sd_np(M)  # now mean across agents (single point)
+            return u_noise, 1
+
+    # not hit by last stored frame: use last mean config
+    u_noise = intrinsic_mean_Sd_np(M)
+    return u_noise, 0
 
 # ---------- Command line arguments ----------
 def parse_args():
@@ -309,17 +366,28 @@ def main():
             same_init_across_runs=True
         )
         traj_noisy_np = np.array(traj_noisy)  # (kept, R, n, d)
-        u_noise, n_conv_runs = noisy_consensus_across_runs(traj_noisy_np, args.threshold)
+        #= u_noise, n_conv_runs = noisy_consensus_across_runs(traj_noisy_np, args.threshold)
+        
+        #if u_noise is None:
+            #drift = np.nan
+        
+        
+        '''else:
+            drift = geodesic_angle_np(u_det, u_noise)'''
+        u_noise, meantraj_flag = meantraj_consensus_across_runs(
+            traj_noisy_np,
+            threshold=args.threshold,
+            mean_refine_steps=args.mean_refine_steps,
+            init_refine=10,
+        )
 
-        if u_noise is None:
-            drift = np.nan
-        else:
-            drift = geodesic_angle_np(u_det, u_noise)
+        drift = geodesic_angle_np(u_det, u_noise)
 
         init_indices.append(i_global)
         drifts.append(float(drift))
         det_converged_flags.append(int(det_flag))
-        runs_converged_counts.append(int(n_conv_runs))
+        #runs_converged_counts.append(int(n_conv_runs))
+        runs_converged_counts.append(int(args.runs_per_init if meantraj_flag == 1 else 0))
 
     # Convert to arrays
     init_indices = np.asarray(init_indices, dtype=np.int32)

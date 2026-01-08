@@ -26,7 +26,7 @@ N=32
 D=3
 BETA=2.0
 DT=0.001
-TMAX=300.0
+TMAX=800.0
 THRESH=0.01
  
 # Intrinsic-mean params

@@ -3,7 +3,8 @@
 
 #SBATCH --job-name=cc_sweep
 #SBATCH --account=def-razvan05
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=8
+#SBATCH --ntasks-per-node=24
 #SBATCH --mem=64G
 #SBATCH --time=0-06:00             # 3 hours
 #SBATCH --output=logs/%x_%A_%a.out # logs/cc_sweep_JOBID_TASKID.out
